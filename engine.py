@@ -71,6 +71,59 @@ PRESETS = {
 }
 
 
+def _mood(bpm, scale, cx, pop, tracks, progs=None, swing=0.0, hum=0.5, sev=False):
+    return dict(bpm=bpm, scale=scale, bars=8, bpb=4, npb=2, complexity=cx, population=pop,
+                swing=swing, humanize=hum, sevenths=sev, progs=progs, mood=True, tracks=tracks)
+
+
+# Moods: scale + tempo + chord progressions + instruments chosen for the feeling.
+# Progressions are 0-based scale degrees (0 = I/i, 3 = IV/iv, 4 = V/v, 5 = vi/VI ...).
+PRESETS.update({
+    "Happy": _mood(100, "Major", 0.50, 0.55, [
+        ("Melody", 1, 4, False), ("Arp", 12, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        progs=[[0, 4, 5, 3], [0, 3, 4, 3], [0, 5, 3, 4], [3, 0, 4, 5]], swing=0.1, hum=0.4),
+    "Sad": _mood(58, "Minor", 0.20, 0.20, [
+        ("Melody", 0, 4, False), ("Chord", 0, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 48, 4, False), ("Arp", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 5, 2, 6], [0, 6, 5, 6], [0, 3, 5, 4], [5, 6, 0, 0]], hum=0.6),
+    "Hopeful": _mood(84, "Major", 0.35, 0.40, [
+        ("Melody", 0, 4, False), ("Arp", 0, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[5, 3, 0, 4], [0, 4, 5, 3], [3, 0, 4, 5], [0, 2, 3, 4]]),
+    "Dreamy": _mood(62, "Lydian", 0.20, 0.25, [
+        ("Melody", 8, 5, False), ("Arp", 46, 3, False), ("Bass", 32, 2, True),
+        ("Pad", 89, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)], sev=True),
+    "Peaceful": _mood(60, "Pentatonic Major", 0.12, 0.15, [
+        ("Melody", 73, 4, False), ("Chord", 0, 3, False), ("Bass", 32, 2, True),
+        ("Pad", 88, 4, False), ("Arp", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 3, 0, 4], [0, 5, 3, 0], [0, 4, 0, 3]]),
+    "Melancholic": _mood(66, "Dorian", 0.30, 0.30, [
+        ("Melody", 4, 4, False), ("Arp", 0, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)], sev=True),
+    "Mysterious": _mood(70, "Pentatonic Minor", 0.30, 0.25, [
+        ("Melody", 10, 5, False), ("Pad", 94, 4, False), ("Chord", 4, 3, False),
+        ("Bass", 32, 2, False), ("Arp", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 5, 0, 6], [0, 2, 5, 2], [0, 6, 5, 6]], sev=True),
+    "Romantic": _mood(72, "Major", 0.30, 0.35, [
+        ("Melody", 0, 4, False), ("Arp", 46, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 5, 3, 4], [0, 2, 3, 4], [3, 4, 0, 5]], sev=True),
+    "Nostalgic": _mood(76, "Major", 0.40, 0.40, [
+        ("Melody", 11, 4, False), ("Rhythm", 5, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 89, 4, True), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        progs=[[0, 5, 1, 4], [0, 2, 3, 3], [0, 5, 3, 4]], swing=0.3, sev=True),
+    "Uplifting": _mood(96, "Major", 0.50, 0.55, [
+        ("Melody", 1, 4, False), ("Arp", 12, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        progs=[[0, 4, 5, 3], [5, 3, 0, 4], [0, 3, 4, 4]], swing=0.1, hum=0.4),
+    "Rainy Day": _mood(72, "Minor", 0.35, 0.30, [
+        ("Melody", 0, 4, False), ("Rhythm", 4, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 89, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        progs=[[0, 5, 2, 6], [0, 3, 6, 2], [0, 5, 3, 6]], swing=0.4, sev=True),
+})
+
+
 @dataclass
 class Note:
     start: float   # beats
@@ -103,6 +156,7 @@ class Settings:
     swing: float = 0.0
     humanize: float = 0.4
     sevenths: bool = False
+    progs: object = None   # optional list of progressions (a mood overrides the default)
 
 
 @dataclass
@@ -168,7 +222,7 @@ def eff_vel(vel, cfg):
 # ---- generation --------------------------------------------------------------------
 
 def gen_degrees(st, rng, bars):
-    prog = rng.choice(PROGRESSIONS[st.scale])
+    prog = rng.choice(st.progs or PROGRESSIONS[st.scale])
     degrees = [prog[i % len(prog)] for i in range(bars)]
     degrees[-1] = 0
     return degrees

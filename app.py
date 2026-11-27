@@ -91,7 +91,7 @@ class App:
         self._style()
         self._vars()
         self._build()
-        self.apply_preset()
+        self.apply_preset("Calm Piano")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
 
@@ -126,6 +126,9 @@ class App:
 
     def _vars(self):
         self.preset = tk.StringVar(value="Calm Piano")
+        self.mood = tk.StringVar(value="")
+        self.active = "Calm Piano"
+        self.cur_progs = None
         self.key = tk.StringVar(value="C")
         self.scale = tk.StringVar(value="Major")
         self.bpm = tk.IntVar(value=68)
@@ -156,11 +159,16 @@ class App:
         # top bar
         top = ttk.Frame(root, padding=(10, 8))
         top.pack(side="top", fill="x")
-        ttk.Label(top, text="Preset").pack(side="left")
-        pc = ttk.Combobox(top, textvariable=self.preset, values=list(engine.PRESETS),
-                          state="readonly", width=16)
-        pc.pack(side="left", padx=(6, 16))
-        pc.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+        styles = [n for n, p in engine.PRESETS.items() if not p.get("mood")]
+        moods = [n for n, p in engine.PRESETS.items() if p.get("mood")]
+        ttk.Label(top, text="Style").pack(side="left")
+        pc = ttk.Combobox(top, textvariable=self.preset, values=styles, state="readonly", width=14)
+        pc.pack(side="left", padx=(6, 12))
+        pc.bind("<<ComboboxSelected>>", lambda e: self.pick_style())
+        ttk.Label(top, text="Mood").pack(side="left")
+        mc = ttk.Combobox(top, textvariable=self.mood, values=moods, state="readonly", width=12)
+        mc.pack(side="left", padx=(6, 16))
+        mc.bind("<<ComboboxSelected>>", lambda e: self.pick_mood())
         ttk.Label(top, text="Section").pack(side="left", padx=(0, 6))
         for i, letter in enumerate("ABCDEF"):
             tk.Radiobutton(top, text=letter, variable=self.sec_var, value=i, indicatoron=False,
@@ -208,7 +216,7 @@ class App:
         r1 = ttk.Frame(ctl)
         r1.pack(anchor="w")
         fld(r1, "Key", combo(self.key, engine.NOTE_NAMES, 5, self.regen_same))
-        fld(r1, "Scale", combo(self.scale, list(engine.SCALES), 16, self.regen_same))
+        fld(r1, "Scale", combo(self.scale, list(engine.SCALES), 16, self.on_scale))
         sp = fld(r1, "Tempo (BPM)", lambda f: ttk.Spinbox(f, from_=40, to=160, textvariable=self.bpm,
                                                          width=6, command=self.restart_if_playing))
         sp.bind("<Return>", lambda e: self.restart_if_playing())
@@ -303,7 +311,7 @@ class App:
             bpb=geti(self.bpb, 4), npb=geti(self.npb, 2),
             complexity=float(self.cx.get()), population=float(self.pop.get()),
             swing=float(self.swing.get()), humanize=float(self.human.get()),
-            sevenths=self.ext.get() != "Triads")
+            sevenths=self.ext.get() != "Triads", progs=self.cur_progs)
 
     def sync_track(self, i):
         cfg, v = self.tracks[i], self.tv[i]
@@ -317,8 +325,22 @@ class App:
         cfg.mute = bool(v["mute"].get())
         cfg.solo = bool(v["solo"].get())
 
-    def apply_preset(self):
-        pr = engine.PRESETS[self.preset.get()]
+    def pick_style(self):
+        self.mood.set("")
+        self.apply_preset(self.preset.get())
+
+    def pick_mood(self):
+        self.preset.set("")
+        self.apply_preset(self.mood.get())
+
+    def on_scale(self):
+        self.cur_progs = None      # a hand-picked scale uses that scale's own progressions
+        self.regen_same()
+
+    def apply_preset(self, name):
+        pr = engine.PRESETS[name]
+        self.active = name
+        self.cur_progs = pr.get("progs")
         self.scale.set(pr["scale"])
         self.bpm.set(pr["bpm"])
         self.bars.set(pr["bars"])
@@ -537,7 +559,7 @@ class App:
             return
         for i in range(engine.NUM_TRACKS):
             self.sync_track(i)
-        name = "%s_%s_%s.mid" % (self.preset.get().replace(" + ", "_").replace(" ", "_"),
+        name = "%s_%s_%s.mid" % (self.active.replace(" + ", "_").replace(" ", "_"),
                                  self.key.get().replace("#", "s"),
                                  "song" if whole_song else "section%s" % "ABCDEF"[self.cur])
         path = filedialog.asksaveasfilename(defaultextension=".mid", initialfile=name,
