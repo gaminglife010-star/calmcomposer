@@ -5,11 +5,14 @@ Model: Settings (global) + 6 TrackCfg (one per track) + Sections (A-F).
 A Section holds its chord progression and the notes of every track.
 """
 import random
+import re
 import struct
 from dataclasses import dataclass, field
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII"]
+# Chord names use flats where musicians expect them (Bb, Eb, Ab, Db).
+CHORD_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
 SCALES = {
     "Major": [0, 2, 4, 5, 7, 9, 11],
@@ -164,9 +167,10 @@ class Section:
     bars: int
     bpb: int
     npb: int
-    degrees: list
+    chords: list          # one Chord per bar, relative to the key
     notes: list = field(default_factory=list)   # one list[Note] per track
     seed: int = 1
+    custom: bool = False  # True once the chords were typed / picked by hand
 
     @property
     def total_beats(self):
@@ -178,32 +182,104 @@ def scale_pitch(scale, idx, root):
     return root + scale[idx % n] + 12 * (idx // n)
 
 
-def chord_name(notes, seventh):
-    root = NOTE_NAMES[notes[0] % 12]
-    third = notes[1] - notes[0]
-    fifth = notes[2] - notes[0]
-    minor = third == 3
-    if seventh and len(notes) > 3:
-        s = notes[3] - notes[0]
-        if not minor:
-            return root + ("maj7" if s == 11 else "7")
-        return root + ("m7" if s == 10 else "m(maj7)" if s == 11 else "dim7")
-    if fifth == 6:
-        return root + "dim"
-    return root + ("m" if minor else "")
+# Chord qualities as semitone intervals above the root.
+QUALITIES = {
+    "": (0, 4, 7), "m": (0, 3, 7), "dim": (0, 3, 6), "aug": (0, 4, 8),
+    "sus2": (0, 2, 7), "sus4": (0, 5, 7), "6": (0, 4, 7, 9), "m6": (0, 3, 7, 9),
+    "7": (0, 4, 7, 10), "maj7": (0, 4, 7, 11), "m7": (0, 3, 7, 10),
+    "m7b5": (0, 3, 6, 10), "dim7": (0, 3, 6, 9), "add9": (0, 4, 7, 14), "madd9": (0, 3, 7, 14),
+}
+_BY_INTERVALS = {v: k for k, v in QUALITIES.items()}
+QUALITY_ALIASES = {
+    "": "", "maj": "", "M": "", "major": "", "m": "m", "min": "m", "-": "m", "minor": "m",
+    "dim": "dim", "o": "dim", "\u00b0": "dim", "aug": "aug", "+": "aug",
+    "sus2": "sus2", "sus4": "sus4", "sus": "sus4", "6": "6", "m6": "m6", "min6": "m6",
+    "7": "7", "dom7": "7", "maj7": "maj7", "M7": "maj7", "\u0394": "maj7", "\u03947": "maj7",
+    "m7": "m7", "min7": "m7", "-7": "m7", "m7b5": "m7b5", "\u00f8": "m7b5", "\u00f87": "m7b5",
+    "dim7": "dim7", "o7": "dim7", "add9": "add9", "madd9": "madd9", "m(add9)": "madd9",
+}
+_FLATS = {"Db": 1, "Eb": 3, "Gb": 6, "Ab": 8, "Bb": 10, "Cb": 11, "Fb": 4, "E#": 5, "B#": 0}
 
 
-def voicing(st, deg, base, sevenths):
+@dataclass(frozen=True)
+class Chord:
+    root: int = 0   # semitones above the key (0-11), so chords follow the Key setting
+    q: str = ""     # quality, a key of QUALITIES
+
+
+def chord_label(st, chord):
+    return CHORD_NAMES[(st.key + chord.root) % 12] + chord.q
+
+
+def parse_chord(st, text):
+    """'Am', 'F#m7', 'Bbmaj7', 'C/E' (slash ignored) -> Chord relative to the key, or None."""
+    t = text.strip().split("/")[0]
+    if not t or t[0].upper() not in "ABCDEFG":
+        return None
+    name = t[0].upper()
+    rest = t[1:]
+    if rest[:1] in ("#", "\u266f"):
+        name += "#"
+        rest = rest[1:]
+    elif rest[:1] == "\u266d" or (rest[:1] == "b" and rest[1:2] not in ("5",) and name + "b" in _FLATS):
+        name += "b"
+        rest = rest[1:]
+    if name in _FLATS:
+        pc = _FLATS[name]
+    elif name in NOTE_NAMES:
+        pc = NOTE_NAMES.index(name)
+    else:
+        return None
+    q = QUALITY_ALIASES.get(rest)
+    if q is None:
+        return None
+    return Chord((pc - st.key) % 12, q)
+
+
+def parse_progression(st, text):
+    """Split on spaces, commas, bars and arrows; returns (chords, bad_tokens)."""
+    tokens = [x for x in re.split(r"[\s,|>\u2192]+", text.replace("-->", " ").replace("->", " ")) if x]
+    chords, bad = [], []
+    for tok in tokens:
+        c = parse_chord(st, tok)
+        (chords if c else bad).append(c if c else tok)
+    return chords, bad
+
+
+def degree_chord(st, deg, sevenths):
+    """Diatonic chord on a scale degree of the (parent) scale, as a Chord."""
     parent = SCALES[PARENT.get(st.scale, st.scale)]
     ks = (0, 2, 4, 6) if sevenths else (0, 2, 4)
-    notes = [scale_pitch(parent, deg + k, base) for k in ks]
+    pcs = [scale_pitch(parent, deg + k, 0) for k in ks]
+    q = _BY_INTERVALS.get(tuple(p - pcs[0] for p in pcs), "")
+    return Chord(pcs[0] % 12, q)
+
+
+def diatonic_chords(st):
+    return [degree_chord(st, d, st.sevenths) for d in range(7)]
+
+
+def nearest_degree(scale, root):
+    """Index of the scale tone closest to a pitch class (used by the melody)."""
+    best, best_d = 0, 99
+    for i, p in enumerate(scale):
+        d = min((p - root) % 12, (root - p) % 12)
+        if d < best_d:
+            best, best_d = i, d
+    return best
+
+
+def voicing(st, chord, base, triad_only=False):
+    r = base + chord.root
+    iv = QUALITIES[chord.q]
+    notes = [r + i for i in (iv[:3] if triad_only else iv)]
     while max(notes) > base + 24:
         notes = [n - 12 for n in notes]
     return notes
 
 
-def chord_name_for(st, deg):
-    return chord_name(voicing(st, deg, 48 + st.key, st.sevenths), st.sevenths)
+def chord_name_for(st, chord):
+    return chord_label(st, chord)
 
 
 def channel_of(i, cfg):
@@ -221,11 +297,11 @@ def eff_vel(vel, cfg):
 
 # ---- generation --------------------------------------------------------------------
 
-def gen_degrees(st, rng, bars):
+def gen_chords(st, rng, bars):
     prog = rng.choice(st.progs or PROGRESSIONS[st.scale])
     degrees = [prog[i % len(prog)] for i in range(bars)]
     degrees[-1] = 0
-    return degrees
+    return [degree_chord(st, d, st.sevenths) for d in degrees]
 
 
 def _track_rng(seed, i, cfg):
@@ -239,7 +315,6 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
     step = 1.0 / npb
     cx = st.complexity
     pop = st.population
-    parent = SCALES[PARENT.get(st.scale, st.scale)]
     base = 12 * (cfg.octave + 1) + st.key
     swing_on = npb in (2, 4)
     notes = []
@@ -285,7 +360,6 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     if mode == "Melody":
         mel = SCALES[st.scale]
-        n = len(mel)
         strong = max(1, npb * 2)
         steps = [-1, 1]
         if cx > 0.25:
@@ -307,7 +381,7 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
                 motif.append((mb, s, dur, off))
         mut = 0.1 + 0.4 * cx
         for bi, deg in enumerate(degrees):
-            dmap = deg if n == 7 else int(round(deg * n / 7.0))
+            dmap = nearest_degree(mel, deg.root)
             if bi == bars - 1:
                 add(bi * bpb, max(1.0, bpb * 0.9), fold(scale_pitch(mel, dmap, base), -3), 60)
                 continue
@@ -325,7 +399,7 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
         p_play = 0.55 + 0.45 * pop
         idx = 0
         for bi, deg in enumerate(degrees):
-            ch = voicing(st, deg, base, st.sevenths)
+            ch = voicing(st, deg, base)
             tones = ch + [ch[0] + 12]
             L = len(tones)
             seq = list(range(L)) + list(range(L - 2, 0, -1))
@@ -341,7 +415,7 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     elif mode == "Chord":
         for bi, deg in enumerate(degrees):
-            ch = voicing(st, deg, base, st.sevenths)
+            ch = voicing(st, deg, base)
             hits = [0]
             if pop > 0.45 and bpb >= 4:
                 hits.append(slots // 2)
@@ -353,7 +427,7 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     elif mode == "Rhythm":
         for bi, deg in enumerate(degrees):
-            ch = voicing(st, deg, base, st.sevenths)
+            ch = voicing(st, deg, base)
             k = int(round(1 + slots * (0.05 + 0.30 * pop) + rng.uniform(-0.5, 0.5)))
             sl = pick_slots(max(1, min(slots, k)), 1.0)
             for i, s in enumerate(sl):
@@ -364,13 +438,13 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     elif mode == "Pad":
         for bi, deg in enumerate(degrees):
-            for nn in voicing(st, deg, base, False):
+            for nn in voicing(st, deg, base, True):
                 add(bi * bpb, bpb * 0.99, nn, 38, True)
 
     elif mode == "Bass":
         for bi, deg in enumerate(degrees):
-            root = base + ((scale_pitch(parent, deg, base) - base) % 12)
-            fifth = base + ((scale_pitch(parent, deg + 4, base) - base) % 12)
+            root = base + deg.root
+            fifth = base + (deg.root + (6 if deg.q in ("dim", "m7b5", "dim7") else 7)) % 12
             if pop < 0.3:
                 add(bi * bpb, bpb * 0.97, root, 66, True)
             else:
@@ -408,28 +482,42 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
     return notes
 
 
-def generate_section(st, tracks, seed, degrees=None):
-    if degrees is None:
-        degrees = gen_degrees(st, random.Random(seed * 1009 + 5), st.bars)
-    sec = Section(bars=len(degrees), bpb=st.bpb, npb=st.npb, degrees=list(degrees), seed=seed)
+def generate_section(st, tracks, seed, chords=None):
+    custom = chords is not None
+    if chords is None:
+        chords = gen_chords(st, random.Random(seed * 1009 + 5), st.bars)
+    sec = Section(bars=len(chords), bpb=st.bpb, npb=st.npb, chords=list(chords), seed=seed,
+                  custom=custom)
     regen_all(sec, st, tracks)
     return sec
 
 
 def regen_all(sec, st, tracks):
-    sec.notes = [gen_track(st, cfg, sec.degrees, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
+    sec.notes = [gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
                  for i, cfg in enumerate(tracks)]
 
 
 def regen_track(sec, st, tracks, i):
     cfg = tracks[i]
     cfg.regen += 1
-    sec.notes[i] = gen_track(st, cfg, sec.degrees, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
+    sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
 
 
-def set_degrees(sec, st, tracks, degrees):
-    sec.degrees = list(degrees)
+def set_chords(sec, st, tracks, chords):
+    """Use hand-picked / typed chords (one per bar). They follow the Key setting."""
+    sec.chords = list(chords)
+    sec.custom = True
     regen_all(sec, st, tracks)
+
+
+def regenerate(sec, st, tracks):
+    """Rebuild a section after a setting changed. Hand-picked chords are kept
+    (and transpose with the Key); generated chords are rebuilt from the seed."""
+    chords = None
+    if sec.custom:
+        chords = [sec.chords[i % len(sec.chords)] for i in range(st.bars)]
+    new = generate_section(st, tracks, sec.seed, chords)
+    return new
 
 
 def vary(sec, st, tracks):

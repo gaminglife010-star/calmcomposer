@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine
 
@@ -74,8 +74,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("CalmComposer")
-        root.geometry("1240x760")
-        root.minsize(1100, 700)
+        root.geometry("1240x830")
+        root.minsize(1100, 780)
         root.configure(bg=BG)
 
         self.midi = WinMidi()
@@ -239,6 +239,20 @@ class App:
             return box
         fld(r2, "Seed", seed_box)
 
+        r3 = ttk.Frame(ctl)
+        r3.pack(anchor="w", pady=(8, 0), fill="x")
+        pf = ttk.Frame(r3)
+        pf.pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Label(pf, text="Chord progression  (type chords, one per bar, e.g.  C Am F G  or  Dm7 G7 Cmaj7)"
+                  ).pack(anchor="w")
+        prow = ttk.Frame(pf)
+        prow.pack(anchor="w", fill="x")
+        self.prog_text = tk.StringVar()
+        self.prog_entry = ttk.Entry(prow, textvariable=self.prog_text, width=62)
+        self.prog_entry.pack(side="left")
+        self.prog_entry.bind("<Return>", lambda e: self.apply_progression())
+        ttk.Button(prow, text="Apply chords", command=self.apply_progression).pack(side="left", padx=6)
+
         ttk.Button(btns, text="GO", style="Go.TButton", command=self.go, width=14).pack(fill="x")
         ttk.Button(btns, text="Gen Chords", command=self.gen_chords).pack(fill="x", pady=(6, 0))
         ttk.Button(btns, text="Gen Variation", command=self.gen_variation).pack(fill="x", pady=(4, 0))
@@ -393,7 +407,7 @@ class App:
         for i in range(engine.NUM_TRACKS):
             self.sync_track(i)
         was = self.is_playing()
-        self.sections[self.cur] = engine.generate_section(self.settings(), self.tracks, sec.seed)
+        self.sections[self.cur] = engine.regenerate(sec, self.settings(), self.tracks)
         self.redraw()
         if was:
             self.play()
@@ -412,8 +426,8 @@ class App:
         if sec is None:
             return self.go()
         st = self.settings()
-        degrees = engine.gen_degrees(st, random.Random(random.randrange(1 << 30)), sec.bars)
-        engine.set_degrees(sec, st, self.tracks, degrees)
+        chords = engine.gen_chords(st, random.Random(random.randrange(1 << 30)), sec.bars)
+        engine.set_chords(sec, st, self.tracks, chords)
         self.redraw()
         self.restart_if_playing()
 
@@ -628,13 +642,15 @@ class App:
                                        fill=color, outline="")
         st = self.settings()
         top = RULER + engine.NUM_TRACKS * LANE
-        for b, deg in enumerate(sec.degrees):
+        for b, deg in enumerate(sec.chords):
             x0 = b * sec.bpb / total * w
             x1 = (b + 1) * sec.bpb / total * w
             c.create_rectangle(x0 + 2, top + 3, x1 - 2, top + CHORD_H - 3, fill=FIELD, outline="")
             c.create_text((x0 + x1) / 2, top + CHORD_H / 2, text=engine.chord_name_for(st, deg),
                           fill=FG, font=("Segoe UI", 10, "bold"))
         c.create_line(0, 0, 0, height, fill="#ffffff", tags="ph", state="hidden")
+        if self.root.focus_get() is not self.prog_entry:
+            self.prog_text.set("  ".join(engine.chord_label(st, ch) for ch in sec.chords))
 
     # ---- editing on the canvas -----------------------------------------------------------
     def on_click(self, e):
@@ -690,23 +706,72 @@ class App:
     def chord_menu(self, bar, e):
         st = self.settings()
         menu = tk.Menu(self.root, tearoff=0)
-        for d in range(7):
-            menu.add_command(label="%s   (%s)" % (engine.chord_name_for(st, d), engine.ROMAN[d]),
-                             command=lambda d=d: self.set_degree(bar, d))
+        for d, c in enumerate(engine.diatonic_chords(st)):
+            menu.add_command(label="%s    (%s)" % (engine.chord_label(st, c), engine.ROMAN[d]),
+                             command=lambda c=c: self.set_chord(bar, c))
+        menu.add_separator()
+        anyc = tk.Menu(menu, tearoff=0)
+        for absolute in range(12):
+            pc = (absolute - st.key) % 12
+            sub = tk.Menu(anyc, tearoff=0)
+            for q in engine.QUALITIES:
+                c = engine.Chord(pc, q)
+                sub.add_command(label=engine.chord_label(st, c), command=lambda c=c: self.set_chord(bar, c))
+            anyc.add_cascade(label=engine.CHORD_NAMES[absolute], menu=sub)
+        menu.add_cascade(label="Any chord  (all notes and types)", menu=anyc)
+        menu.add_command(label="Type a chord...", command=lambda: self.type_chord(bar))
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
 
-    def set_degree(self, bar, deg):
+    def type_chord(self, bar):
+        text = simpledialog.askstring("Chord", "Type a chord, for example  Am   F#m7   Bbmaj7   G7:",
+                                      parent=self.root)
+        if not text:
+            return
+        c = engine.parse_chord(self.settings(), text)
+        if c is None:
+            self.status.config(text="Not a chord: " + text)
+            return
+        self.set_chord(bar, c)
+
+    def set_chord(self, bar, chord):
         sec = self.current()
         if sec is None:
             return
-        degrees = list(sec.degrees)
-        degrees[bar] = deg
-        engine.set_degrees(sec, self.settings(), self.tracks, degrees)
+        chords = list(sec.chords)
+        chords[bar] = chord
+        engine.set_chords(sec, self.settings(), self.tracks, chords)
         self.redraw()
         self.restart_if_playing()
+
+    def apply_progression(self):
+        sec = self.current()
+        if sec is None:
+            return
+        st = self.settings()
+        chords, bad = engine.parse_progression(st, self.prog_text.get())
+        if bad:
+            self.status.config(text="Not understood: " + " ".join(bad))
+            return
+        if not chords:
+            return
+        bars = sec.bars
+        if len(chords) > bars:
+            bars = next((b for b in (4, 8, 16, 32) if b >= len(chords)), 32)
+            self.bars.set(bars)
+            st = self.settings()
+        cycled = [chords[i % len(chords)] for i in range(bars)]
+        for i in range(engine.NUM_TRACKS):
+            self.sync_track(i)
+        was = self.is_playing()
+        self.sections[self.cur] = engine.generate_section(st, self.tracks, sec.seed, cycled)
+        self.status.config(text="Chords applied" + (" (repeated to fill the bars)" if len(chords) < bars else ""))
+        self.root.focus_set()
+        self.redraw()
+        if was:
+            self.play()
 
     def on_close(self):
         self.stop()
