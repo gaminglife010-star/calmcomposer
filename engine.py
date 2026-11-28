@@ -4,10 +4,11 @@ piano + nature and relaxing lofi.  Pure Python, no dependencies.
 Model: Settings (global) + 6 TrackCfg (one per track) + Sections (A-F).
 A Section holds its chord progression and the notes of every track.
 """
+import math
 import random
 import re
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII"]
@@ -124,6 +125,49 @@ PRESETS.update({
         ("Melody", 0, 4, False), ("Rhythm", 4, 3, False), ("Bass", 33, 2, False),
         ("Pad", 89, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
         progs=[[0, 5, 2, 6], [0, 3, 6, 2], [0, 5, 3, 6]], swing=0.4, sev=True),
+})
+
+
+def _plat(length, bpm, scale, cx, pop, tracks, progs=None, swing=0.0, hum=0.5, sev=False):
+    d = _mood(bpm, scale, cx, pop, tracks, progs, swing, hum, sev)
+    d.pop("mood")
+    d["platform"] = True
+    d["length"] = length      # suggested minutes: ~3 for Spotify singles, 30-60 for YouTube
+    return d
+
+
+# Platform presets: tuned for Spotify singles (about 3 min) and YouTube long videos.
+PRESETS.update({
+    "Sleep Music": _plat(60, 48, "Major", 0.08, 0.10, [
+        ("Pad", 89, 4, False), ("Melody", 8, 5, False), ("Chord", 0, 3, False),
+        ("Bass", 32, 2, False), ("Arp", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 3, 0, 4], [0, 5, 3, 4], [0, 4, 3, 0]]),
+    "Study Lofi": _plat(30, 74, "Minor", 0.40, 0.38, [
+        ("Melody", 0, 4, False), ("Rhythm", 4, 3, False), ("Bass", 33, 2, False),
+        ("Pad", 89, 4, True), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        swing=0.45, hum=0.6, sev=True),
+    "Meditation": _plat(30, 54, "Pentatonic Major", 0.10, 0.12, [
+        ("Melody", 73, 4, False), ("Pad", 88, 4, False), ("Chord", 46, 3, False),
+        ("Bass", 32, 2, True), ("Arp", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 3, 0, 4], [0, 5, 0, 3]]),
+    "Spa & Relax": _plat(30, 60, "Lydian", 0.20, 0.25, [
+        ("Melody", 46, 4, False), ("Arp", 24, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 89, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)], sev=True),
+    "Rainy Cafe": _plat(30, 80, "Minor", 0.40, 0.35, [
+        ("Melody", 0, 4, False), ("Rhythm", 4, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 89, 4, True), ("Chord", 0, 3, True), ("Drums", 0, 3, False)],
+        progs=[[0, 3, 6, 2], [0, 5, 3, 4], [0, 2, 5, 6]], swing=0.45, hum=0.6, sev=True),
+    "Healing Piano": _plat(3, 64, "Major", 0.30, 0.30, [
+        ("Melody", 0, 4, False), ("Arp", 0, 3, False), ("Bass", 32, 2, True),
+        ("Pad", 48, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 4, 5, 3], [5, 3, 0, 4], [0, 5, 3, 4]]),
+    "Morning Calm": _plat(3, 76, "Major", 0.35, 0.40, [
+        ("Melody", 24, 4, False), ("Arp", 0, 3, False), ("Bass", 32, 2, False),
+        ("Pad", 89, 4, False), ("Chord", 0, 3, True), ("Drums", 0, 3, True)],
+        progs=[[0, 4, 5, 3], [0, 3, 4, 3], [5, 3, 0, 4]]),
+    "Focus Ambient": _plat(60, 58, "Dorian", 0.10, 0.12, [
+        ("Pad", 94, 4, False), ("Chord", 4, 3, False), ("Melody", 11, 4, False),
+        ("Bass", 32, 2, False), ("Arp", 0, 3, True), ("Drums", 0, 3, True)], sev=True),
 })
 
 
@@ -525,6 +569,101 @@ def vary(sec, st, tracks):
     for i, cfg in enumerate(tracks):
         if cfg.mode in ("Melody", "Arp", "Rhythm"):
             regen_track(sec, st, tracks, i)
+
+
+# ---- full-length arrangement (Spotify single / YouTube long video) -----------------------
+
+_PATTERN = ["A", "A2", "B", "A2", "A", "B2"]
+PART_NAMES = {"Intro": "Intro", "Outro": "Outro", "A": "Theme", "A2": "Theme (new melody)",
+              "B": "Contrast", "B2": "Contrast (new melody)"}
+
+
+def _ramp(sec, f0, f1):
+    """Fade velocities linearly across a section (a soft fade in / out)."""
+    total = float(sec.total_beats)
+    for ns in sec.notes:
+        for n in ns:
+            f = f0 + (f1 - f0) * min(1.0, max(0.0, n.start / total))
+            n.vel = max(1, min(127, int(n.vel * f)))
+
+
+def _thin(sec, st, tracks, drop_modes):
+    """Empty the tracks whose mode is in drop_modes, but never leave the section silent."""
+    ok = audible(tracks)
+    kept = []
+    for i, cfg in enumerate(tracks):
+        if cfg.mode in drop_modes:
+            sec.notes[i] = []
+        elif ok[i] and sec.notes[i]:
+            kept.append(i)
+    if not kept:   # e.g. a lofi preset with only bass left: bring the melody back
+        for i, cfg in enumerate(tracks):
+            if ok[i] and cfg.mode in ("Melody", "Arp"):
+                sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg),
+                                         sec.bpb, sec.npb)
+
+
+
+def build_arrangement(st, tracks, target_sec, home, base_seed):
+    """Turn one idea into a full track of about target_sec seconds:
+    Intro -> Theme / Contrast sections (new melodies, slow density waves) -> Outro.
+    Returns (sections, parts); parts = [(label, bars, start_sec, end_sec)]."""
+    rng = random.Random(base_seed * 31 + 7)
+    bar_sec = st.bpb * 60.0 / st.bpm
+    total_bars = max(12, int(round(target_sec / bar_sec)))
+    sec_bars = st.bars if st.bars >= 4 else 8
+    sizes, rem = [], total_bars
+    while rem >= 4:
+        b = min(sec_bars, rem)
+        sizes.append(b)
+        rem -= b
+    while len(sizes) < 3:
+        sizes.append(sec_bars)
+
+    def cycle(chords, n):
+        return [chords[i % len(chords)] for i in range(n)]
+
+    # a contrasting progression for the "B" parts
+    alt = gen_chords(st, rng, sec_bars)
+    for _ in range(12):
+        if tuple(alt[:4]) != tuple(cycle(home, sec_bars)[:4]):
+            break
+        alt = gen_chords(st, rng, sec_bars)
+
+    sections, parts, acc = [], [], 0.0
+    seen = {}
+    n = len(sizes)
+    for k, b in enumerate(sizes):
+        if k == 0:
+            kind = "Intro"
+        elif k == n - 1:
+            kind = "Outro"
+        else:
+            kind = _PATTERN[(k - 1) % len(_PATTERN)]
+        use_alt = kind in ("B", "B2")
+        chords = cycle(alt if use_alt else home, b)
+        if kind == "Outro":
+            chords[-1] = degree_chord(st, 0, st.sevenths)     # come home on the tonic
+        m = seen.get(kind, 0)
+        seen[kind] = m + 1
+        if kind in ("A", "B"):
+            seed = base_seed + (0 if m % 3 == 0 else 13 * m) + (7 if use_alt else 0)
+        else:
+            seed = base_seed + 101 * (k + 1)
+        wave = 0.8 + 0.4 * (0.5 + 0.5 * math.sin(2 * math.pi * k / 10.0))
+        stk = replace(st, population=max(0.05, min(1.0, st.population * wave)))
+        sec = generate_section(stk, tracks, seed, chords)
+        if kind == "Intro":
+            _thin(sec, stk, tracks, ("Melody", "Arp", "Rhythm", "Drums"))
+            _ramp(sec, 0.3, 1.0)
+        elif kind == "Outro":
+            _thin(sec, stk, tracks, ("Rhythm", "Drums"))
+            _ramp(sec, 1.0, 0.12)
+        sections.append(sec)
+        span = b * bar_sec
+        parts.append((PART_NAMES[kind], kind, b, acc, acc + span))
+        acc += span
+    return sections, parts
 
 
 # ---- MIDI file ---------------------------------------------------------------------------

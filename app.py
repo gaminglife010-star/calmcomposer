@@ -27,6 +27,10 @@ DIM = "#4a5068"
 RULER = 22
 LANE = 62
 CHORD_H = 34
+TL_H = 30
+TL_COLORS = {"Intro": "#5b6b8c", "A": "#8ab4f8", "A2": "#6f9be0",
+             "B": "#bb9af7", "B2": "#a283e6", "Outro": "#5b6b8c"}
+TL_SHORT = {"Intro": "Intro", "A": "Theme", "A2": "Var", "B": "Contrast", "B2": "Var", "Outro": "Outro"}
 LEFT_W = 410
 DRUM_ROWS = [42, 38, 36]   # hat (top), snare, kick (bottom)
 
@@ -127,6 +131,13 @@ class App:
     def _vars(self):
         self.preset = tk.StringVar(value="Calm Piano")
         self.mood = tk.StringVar(value="")
+        self.platform = tk.StringVar(value="")
+        self.length = tk.StringVar(value="3 min")
+        self.full = None
+        self.full_parts = []
+        self.full_bpm = 0
+        self.play_full = False
+        self.tl_x0, self.tl_w, self.tl_y0 = 6, 100, 0
         self.active = "Calm Piano"
         self.cur_progs = None
         self.key = tk.StringVar(value="C")
@@ -159,7 +170,8 @@ class App:
         # top bar
         top = ttk.Frame(root, padding=(10, 8))
         top.pack(side="top", fill="x")
-        styles = [n for n, p in engine.PRESETS.items() if not p.get("mood")]
+        styles = [n for n, p in engine.PRESETS.items() if not p.get("mood") and not p.get("platform")]
+        platforms = [n for n, p in engine.PRESETS.items() if p.get("platform")]
         moods = [n for n, p in engine.PRESETS.items() if p.get("mood")]
         ttk.Label(top, text="Style").pack(side="left")
         pc = ttk.Combobox(top, textvariable=self.preset, values=styles, state="readonly", width=14)
@@ -182,6 +194,23 @@ class App:
         ttk.Button(top, text="Export song", command=lambda: self.export(True)).pack(side="left", padx=4)
         self.status = tk.Label(top, text="", bg=PANEL, fg=MUTED, anchor="e")
         self.status.pack(side="right", fill="x", expand=True)
+
+        # release bar: platform preset, target length, full track
+        rel = ttk.Frame(root, padding=(10, 0, 10, 8))
+        rel.pack(side="top", fill="x")
+        ttk.Label(rel, text="Release").pack(side="left")
+        ttk.Label(rel, text="Platform").pack(side="left", padx=(12, 4))
+        plc = ttk.Combobox(rel, textvariable=self.platform, values=platforms, state="readonly", width=14)
+        plc.pack(side="left")
+        plc.bind("<<ComboboxSelected>>", lambda e: self.pick_platform())
+        ttk.Label(rel, text="Length").pack(side="left", padx=(12, 4))
+        ttk.Combobox(rel, textvariable=self.length, values=["3 min", "5 min", "10 min", "30 min", "60 min", "120 min"],
+                     state="readonly", width=8).pack(side="left")
+        ttk.Button(rel, text="Build full track", command=self.build_full).pack(side="left", padx=(12, 4))
+        ttk.Button(rel, text="Play / Stop full", command=self.toggle_full).pack(side="left", padx=4)
+        ttk.Button(rel, text="Export full track", command=self.export_full).pack(side="left", padx=4)
+        self.full_info = tk.Label(rel, text="", bg=PANEL, fg=MUTED, anchor="w")
+        self.full_info.pack(side="left", padx=10)
 
         # bottom panel (packed before the middle so it is never cut off)
         bot = ttk.Frame(root, padding=10)
@@ -341,11 +370,18 @@ class App:
 
     def pick_style(self):
         self.mood.set("")
+        self.platform.set("")
         self.apply_preset(self.preset.get())
 
     def pick_mood(self):
         self.preset.set("")
+        self.platform.set("")
         self.apply_preset(self.mood.get())
+
+    def pick_platform(self):
+        self.preset.set("")
+        self.mood.set("")
+        self.apply_preset(self.platform.get())
 
     def on_scale(self):
         self.cur_progs = None      # a hand-picked scale uses that scale's own progressions
@@ -355,6 +391,8 @@ class App:
         pr = engine.PRESETS[name]
         self.active = name
         self.cur_progs = pr.get("progs")
+        if pr.get("length"):
+            self.length.set("%d min" % pr["length"])
         self.scale.set(pr["scale"])
         self.bpm.set(pr["bpm"])
         self.bars.set(pr["bars"])
@@ -378,6 +416,9 @@ class App:
         self.sections = [None] * 6
         self.cur = 0
         self.sec_var.set(0)
+        self.full = None
+        self.full_parts = []
+        self.full_info.config(text="")
         self.go()
 
     # ---- generation ---------------------------------------------------------------
@@ -385,7 +426,7 @@ class App:
         return self.sections[self.cur]
 
     def go(self):
-        was = self.is_playing()
+        was = self.is_playing() and not self.play_full
         try:
             seed = int(self.seed.get())
         except ValueError:
@@ -406,7 +447,7 @@ class App:
             return self.go()
         for i in range(engine.NUM_TRACKS):
             self.sync_track(i)
-        was = self.is_playing()
+        was = self.is_playing() and not self.play_full
         self.sections[self.cur] = engine.regenerate(sec, self.settings(), self.tracks)
         self.redraw()
         if was:
@@ -478,25 +519,32 @@ class App:
             self.play()
 
     def restart_if_playing(self):
-        if self.is_playing():
+        if self.is_playing() and not self.play_full:
             self.play()
 
     def audible(self, i):
         return engine.audible(self.tracks)[i]
 
-    def play(self):
+    def play(self, full=False):
         if not self.midi.ok:
             messagebox.showinfo("Preview", "Live preview works on Windows only.\nUse Export instead.")
             return
         st = self.settings()
-        if self.song_mode.get():
-            idx = [k for k, s in enumerate(self.sections) if s is not None]
+        if full:
+            if not self.full:
+                return
+            secs = list(self.full)
+            idx = [-1] * len(secs)
         else:
-            idx = [self.cur] if self.current() else []
-        if not idx:
-            return
+            if self.song_mode.get():
+                idx = [k for k, s in enumerate(self.sections) if s is not None]
+            else:
+                idx = [self.cur] if self.current() else []
+            if not idx:
+                return
+            secs = [self.sections[k] for k in idx]
         self.stop()
-        secs = [self.sections[k] for k in idx]
+        self.play_full = full
         msgs = engine.to_messages(secs, st, self.tracks)
         spb = 60.0 / st.bpm
         ranges, acc = [], 0.0
@@ -545,23 +593,84 @@ class App:
 
     def tick(self):
         c = self.canvas
+        c.itemconfigure("ph", state="hidden")
+        c.itemconfigure("tph", state="hidden")
         if self.is_playing() and self.play_ranges:
             total = self.play_ranges[-1][1]
             pos = (time.perf_counter() - self.t0) % total
-            for a, b, k in self.play_ranges:
-                if a <= pos < b:
-                    if k != self.cur:
-                        self.cur = k
-                        self.sec_var.set(k)
-                        self.seed.set(str(self.sections[k].seed))
-                        self.redraw()
-                    x = (pos - a) / (b - a) * c.winfo_width()
-                    c.coords("ph", x, 0, x, c.winfo_height())
-                    c.itemconfigure("ph", state="normal")
-                    break
-        else:
-            c.itemconfigure("ph", state="hidden")
+            if self.play_full:
+                x = self.tl_x0 + pos / total * self.tl_w
+                c.coords("tph", x, self.tl_y0 - 4, x, self.tl_y0 + TL_H + 4)
+                c.itemconfigure("tph", state="normal")
+                self.full_info.config(text="Playing %s / %s" % (self.clock(pos), self.clock(total)))
+            else:
+                for a_, b_, k in self.play_ranges:
+                    if a_ <= pos < b_:
+                        if k >= 0 and k != self.cur:
+                            self.cur = k
+                            self.sec_var.set(k)
+                            self.seed.set(str(self.sections[k].seed))
+                            self.redraw()
+                        x = (pos - a_) / (b_ - a_) * c.winfo_width()
+                        c.coords("ph", x, 0, x, c.winfo_height())
+                        c.itemconfigure("ph", state="normal")
+                        break
         self.root.after(30, self.tick)
+
+    @staticmethod
+    def clock(sec):
+        sec = int(sec)
+        return "%d:%02d" % (sec // 60, sec % 60)
+
+    # ---- full track (Spotify single / YouTube long video) ---------------------------
+    def minutes(self):
+        try:
+            return int(self.length.get().split()[0])
+        except (ValueError, IndexError):
+            return 3
+
+    def build_full(self):
+        sec = self.current()
+        if sec is None:
+            self.go()
+            sec = self.current()
+        for i in range(engine.NUM_TRACKS):
+            self.sync_track(i)
+        st = self.settings()
+        self.full, self.full_parts = engine.build_arrangement(
+            st, self.tracks, self.minutes() * 60, sec.chords, sec.seed)
+        self.full_bpm = st.bpm
+        total = self.full_parts[-1][4]
+        self.full_info.config(text="Full track %s  -  %d sections (your chords are the Theme)" %
+                              (self.clock(total), len(self.full)))
+        self.redraw()
+
+    def ensure_full(self):
+        if self.full is None or self.full_bpm != self.settings().bpm:
+            self.build_full()
+        return self.full is not None
+
+    def toggle_full(self):
+        if self.is_playing() and self.play_full:
+            self.stop()
+            return
+        if self.ensure_full():
+            self.play(full=True)
+
+    def export_full(self):
+        if not self.ensure_full():
+            return
+        for i in range(engine.NUM_TRACKS):
+            self.sync_track(i)
+        name = "%s_%s_%dmin.mid" % (self.active.replace(" + ", "_").replace(" & ", "_").replace(" ", "_"),
+                                    self.key.get().replace("#", "s"), self.minutes())
+        path = filedialog.asksaveasfilename(defaultextension=".mid", initialfile=name,
+                                            filetypes=[("MIDI file", "*.mid")])
+        if not path:
+            return
+        with open(path, "wb") as f:
+            f.write(engine.to_midi(self.full, self.settings(), self.tracks))
+        self.status.config(text="Saved: " + path)
 
     # ---- export ------------------------------------------------------------------------
     def export(self, whole_song):
@@ -648,9 +757,32 @@ class App:
             c.create_rectangle(x0 + 2, top + 3, x1 - 2, top + CHORD_H - 3, fill=FIELD, outline="")
             c.create_text((x0 + x1) / 2, top + CHORD_H / 2, text=engine.chord_name_for(st, deg),
                           fill=FG, font=("Segoe UI", 10, "bold"))
+        self.draw_timeline(w, height)
         c.create_line(0, 0, 0, height, fill="#ffffff", tags="ph", state="hidden")
+        c.create_line(0, 0, 0, 10, fill="#ffffff", width=2, tags="tph", state="hidden")
         if self.root.focus_get() is not self.prog_entry:
             self.prog_text.set("  ".join(engine.chord_label(st, ch) for ch in sec.chords))
+
+    def draw_timeline(self, w, top):
+        c = self.canvas
+        y0 = top + 18
+        self.tl_x0, self.tl_w, self.tl_y0 = 6, max(10, w - 12), y0
+        c.create_text(6, y0 - 12, text="FULL TRACK", anchor="w", fill=MUTED, font=("Segoe UI", 8, "bold"))
+        if not self.full_parts:
+            c.create_rectangle(6, y0, w - 6, y0 + TL_H, outline=GRID, fill=BG2)
+            c.create_text(w / 2, y0 + TL_H / 2, fill=MUTED,
+                          text="Pick a Platform and Length, then press  Build full track")
+            return
+        total = self.full_parts[-1][4]
+        for label, kind, bars, a0, a1 in self.full_parts:
+            x0 = 6 + a0 / total * self.tl_w
+            x1 = 6 + a1 / total * self.tl_w
+            c.create_rectangle(x0, y0, max(x1 - 1, x0 + 1), y0 + TL_H, fill=TL_COLORS.get(kind, DIM), outline="")
+            if x1 - x0 > 46:
+                c.create_text((x0 + x1) / 2, y0 + TL_H / 2, text=TL_SHORT.get(kind, kind),
+                              fill="#10131c", font=("Segoe UI", 8, "bold"))
+        c.create_text(6, y0 + TL_H + 9, text="0:00", anchor="w", fill=MUTED, font=("Segoe UI", 8))
+        c.create_text(w - 6, y0 + TL_H + 9, text=self.clock(total), anchor="e", fill=MUTED, font=("Segoe UI", 8))
 
     # ---- editing on the canvas -----------------------------------------------------------
     def on_click(self, e):
@@ -765,7 +897,7 @@ class App:
         cycled = [chords[i % len(chords)] for i in range(bars)]
         for i in range(engine.NUM_TRACKS):
             self.sync_track(i)
-        was = self.is_playing()
+        was = self.is_playing() and not self.play_full
         self.sections[self.cur] = engine.generate_section(st, self.tracks, sec.seed, cycled)
         self.status.config(text="Chords applied" + (" (repeated to fill the bars)" if len(chords) < bars else ""))
         self.root.focus_set()
