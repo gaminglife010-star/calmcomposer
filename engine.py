@@ -215,6 +215,7 @@ class Section:
     notes: list = field(default_factory=list)   # one list[Note] per track
     seed: int = 1
     custom: bool = False  # True once the chords were typed / picked by hand
+    var: int = 0          # accompaniment variation (chords, pad, bass, drums); the melody ignores it
 
     @property
     def total_beats(self):
@@ -313,10 +314,12 @@ def nearest_degree(scale, root):
     return best
 
 
-def voicing(st, chord, base, triad_only=False):
+def voicing(st, chord, base, triad_only=False, inv=0):
     r = base + chord.root
     iv = QUALITIES[chord.q]
     notes = [r + i for i in (iv[:3] if triad_only else iv)]
+    for _ in range(inv):            # inversion: lift the lowest note an octave
+        notes.append(notes.pop(0) + 12)
     while max(notes) > base + 24:
         notes = [n - 12 for n in notes]
     return notes
@@ -348,8 +351,9 @@ def gen_chords(st, rng, bars):
     return [degree_chord(st, d, st.sevenths) for d in degrees]
 
 
-def _track_rng(seed, i, cfg):
-    return random.Random(seed * 131 + i * 17 + cfg.regen * 7919)
+def _track_rng(seed, i, cfg, var=0):
+    v = 0 if cfg.mode in ("Melody", "Arp") else var
+    return random.Random(seed * 131 + i * 17 + cfg.regen * 7919 + v * 104729)
 
 
 def gen_track(st, cfg, degrees, rng, bpb, npb):
@@ -399,6 +403,22 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
         while p < base + lo:
             p += 12
         return p
+
+    prev = [None]
+
+    def led_voicing(chord, triad_only=False):
+        """Pick the inversion closest to the previous chord (smooth voice leading),
+        with a little randomness so repeated sections are not identical."""
+        n = 3 if triad_only else len(QUALITIES[chord.q])
+        ref = prev[0] if prev[0] is not None else base + 8
+        cands = []
+        for inv in range(n):
+            v = voicing(st, chord, base, triad_only, inv)
+            cands.append((abs(sum(v) / float(len(v)) - ref), inv, v))
+        cands.sort()
+        pick = cands[0] if (len(cands) == 1 or rng.random() < 0.65) else cands[1]
+        prev[0] = sum(pick[2]) / float(len(pick[2]))
+        return pick[2]
 
     mode = cfg.mode
 
@@ -459,19 +479,20 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     elif mode == "Chord":
         for bi, deg in enumerate(degrees):
-            ch = voicing(st, deg, base)
+            ch = led_voicing(deg)
             hits = [0]
-            if pop > 0.45 and bpb >= 4:
-                hits.append(slots // 2)
+            if bpb >= 3 and rng.random() < min(0.85, pop * 1.3):
+                hits.append(rng.choice([slots // 2, max(1, slots - npb)]))
+                hits = sorted(set(hits))
             for hi_, h in enumerate(hits):
                 end = hits[hi_ + 1] if hi_ + 1 < len(hits) else slots
                 dur = (end - h) * step * 0.97
-                for j, nn in enumerate(ch + [ch[0] - 12]):
+                for j, nn in enumerate(ch + [base + deg.root - 12]):
                     add(tm(bi, h) + j * 0.05, dur, nn, 56)
 
     elif mode == "Rhythm":
         for bi, deg in enumerate(degrees):
-            ch = voicing(st, deg, base)
+            ch = led_voicing(deg)
             k = int(round(1 + slots * (0.05 + 0.30 * pop) + rng.uniform(-0.5, 0.5)))
             sl = pick_slots(max(1, min(slots, k)), 1.0)
             for i, s in enumerate(sl):
@@ -482,7 +503,7 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
 
     elif mode == "Pad":
         for bi, deg in enumerate(degrees):
-            for nn in voicing(st, deg, base, True):
+            for nn in led_voicing(deg, True):
                 add(bi * bpb, bpb * 0.99, nn, 38, True)
 
     elif mode == "Bass":
@@ -490,7 +511,16 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
             root = base + deg.root
             fifth = base + (deg.root + (6 if deg.q in ("dim", "m7b5", "dim7") else 7)) % 12
             if pop < 0.3:
-                add(bi * bpb, bpb * 0.97, root, 66, True)
+                r = rng.random()
+                half = bpb / 2.0
+                if r < 0.55 or bpb < 4:
+                    add(bi * bpb, bpb * 0.97, root, 66, True)
+                elif r < 0.80:
+                    add(bi * bpb, half * 0.97, root, 66, True)
+                    add(bi * bpb + half, half * 0.95, fifth if rng.random() < 0.6 else root + 12, 58, True)
+                else:
+                    add(bi * bpb, (bpb - 1) * 0.97, root, 66, True)
+                    add(bi * bpb + bpb - 1, 0.95, fifth, 56, True)
             else:
                 k = int(round(1 + slots * 0.25 * pop + rng.uniform(-0.5, 0.5)))
                 sl = pick_slots(max(1, min(slots, k)), 1.0)
@@ -526,25 +556,25 @@ def gen_track(st, cfg, degrees, rng, bpb, npb):
     return notes
 
 
-def generate_section(st, tracks, seed, chords=None):
+def generate_section(st, tracks, seed, chords=None, var=0):
     custom = chords is not None
     if chords is None:
         chords = gen_chords(st, random.Random(seed * 1009 + 5), st.bars)
     sec = Section(bars=len(chords), bpb=st.bpb, npb=st.npb, chords=list(chords), seed=seed,
-                  custom=custom)
+                  custom=custom, var=var)
     regen_all(sec, st, tracks)
     return sec
 
 
 def regen_all(sec, st, tracks):
-    sec.notes = [gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
+    sec.notes = [gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg, sec.var), sec.bpb, sec.npb)
                  for i, cfg in enumerate(tracks)]
 
 
 def regen_track(sec, st, tracks, i):
     cfg = tracks[i]
     cfg.regen += 1
-    sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg), sec.bpb, sec.npb)
+    sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg, sec.var), sec.bpb, sec.npb)
 
 
 def set_chords(sec, st, tracks, chords):
@@ -560,7 +590,7 @@ def regenerate(sec, st, tracks):
     chords = None
     if sec.custom:
         chords = [sec.chords[i % len(sec.chords)] for i in range(st.bars)]
-    new = generate_section(st, tracks, sec.seed, chords)
+    new = generate_section(st, tracks, sec.seed, chords, sec.var)
     return new
 
 
@@ -599,15 +629,39 @@ def _thin(sec, st, tracks, drop_modes):
     if not kept:   # e.g. a lofi preset with only bass left: bring the melody back
         for i, cfg in enumerate(tracks):
             if ok[i] and cfg.mode in ("Melody", "Arp"):
-                sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg),
+                sec.notes[i] = gen_track(st, cfg, sec.chords, _track_rng(sec.seed, i, cfg, sec.var),
                                          sec.bpb, sec.npb)
 
 
 
+_EXT_MAJOR = ["", "add9", "6", "maj7"]
+_EXT_MINOR = ["m", "m7", "madd9"]
+
+
+def vary_chords(chords, rng):
+    """Same harmony, fresher colour: swap in extensions, and sometimes lead back with the
+    dominant (V) at the end of a 4-bar phrase."""
+    out = []
+    for c in chords:
+        q = c.q
+        if rng.random() < 0.45:
+            if q == "":
+                q = rng.choice(_EXT_MAJOR)
+            elif q == "m":
+                q = rng.choice(_EXT_MINOR)
+        out.append(Chord(c.root, q))
+    for i in range(3, len(out) - 1, 4):
+        if rng.random() < 0.35:
+            out[i] = Chord(7, "")
+    return out
+
+
 def build_arrangement(st, tracks, target_sec, home, base_seed):
     """Turn one idea into a full track of about target_sec seconds:
-    Intro -> Theme / Contrast sections (new melodies, slow density waves) -> Outro.
-    Returns (sections, parts); parts = [(label, bars, start_sec, end_sec)]."""
+    Intro -> Theme / Contrast sections -> Outro.  The Theme is your chords; Contrast parts
+    rotate through other progressions; repeats get new chord colours, new voicings and
+    new bass / chord rhythms so nothing loops identically.
+    Returns (sections, parts); parts = [(label, kind, bars, start_sec, end_sec)]."""
     rng = random.Random(base_seed * 31 + 7)
     bar_sec = st.bpb * 60.0 / st.bpm
     total_bars = max(12, int(round(target_sec / bar_sec)))
@@ -623,12 +677,18 @@ def build_arrangement(st, tracks, target_sec, home, base_seed):
     def cycle(chords, n):
         return [chords[i % len(chords)] for i in range(n)]
 
-    # a contrasting progression for the "B" parts
-    alt = gen_chords(st, rng, sec_bars)
-    for _ in range(12):
-        if tuple(alt[:4]) != tuple(cycle(home, sec_bars)[:4]):
-            break
-        alt = gen_chords(st, rng, sec_bars)
+    # other progressions for the Contrast parts (never the same as the Theme)
+    home_key = tuple(cycle(home, sec_bars)[:4])
+    tonic = degree_chord(st, 0, st.sevenths)
+    alts = []
+    for pr in (st.progs or PROGRESSIONS[st.scale]):
+        cand = [degree_chord(st, pr[i % len(pr)], st.sevenths) for i in range(sec_bars)]
+        cand[-1] = tonic
+        if tuple(cand[:4]) != home_key and cand not in alts:
+            alts.append(cand)
+    rng.shuffle(alts)
+    if not alts:
+        alts = [gen_chords(st, rng, sec_bars)]
 
     sections, parts, acc = [], [], 0.0
     seen = {}
@@ -640,19 +700,24 @@ def build_arrangement(st, tracks, target_sec, home, base_seed):
             kind = "Outro"
         else:
             kind = _PATTERN[(k - 1) % len(_PATTERN)]
-        use_alt = kind in ("B", "B2")
-        chords = cycle(alt if use_alt else home, b)
-        if kind == "Outro":
-            chords[-1] = degree_chord(st, 0, st.sevenths)     # come home on the tonic
         m = seen.get(kind, 0)
         seen[kind] = m + 1
+        if kind in ("B", "B2"):
+            bi = seen.get("B", 0) + seen.get("B2", 0) - 1
+            chords = cycle(alts[bi % len(alts)], b)
+        else:
+            chords = cycle(home, b)
+        if kind in ("A2", "B2"):
+            chords = vary_chords(chords, rng)
+        if kind == "Outro":
+            chords[-1] = tonic                               # come home on the tonic
         if kind in ("A", "B"):
-            seed = base_seed + (0 if m % 3 == 0 else 13 * m) + (7 if use_alt else 0)
+            seed = base_seed + (0 if m % 3 == 0 else 13 * m) + (7 if kind == "B" else 0)
         else:
             seed = base_seed + 101 * (k + 1)
         wave = 0.8 + 0.4 * (0.5 + 0.5 * math.sin(2 * math.pi * k / 10.0))
         stk = replace(st, population=max(0.05, min(1.0, st.population * wave)))
-        sec = generate_section(stk, tracks, seed, chords)
+        sec = generate_section(stk, tracks, seed, chords, var=k)
         if kind == "Intro":
             _thin(sec, stk, tracks, ("Melody", "Arp", "Rhythm", "Drums"))
             _ramp(sec, 0.3, 1.0)
